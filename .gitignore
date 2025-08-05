@@ -1,0 +1,26 @@
+# 数据文件
+datas/
+xx.xlsx
+yy.xlsx
+tt.xlsx
+
+# 训练好的模型
+trained_models/
+*.pth
+*.save
+
+# 训练过程和预测结果
+training_results/
+prediction_results/
+*.png
+*.csv
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE/Editor specific files
+.vscode/
+.idea/
