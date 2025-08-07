@@ -25,9 +25,9 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(CURRENT_DIR, 'datas')
 MODELS_DIR = os.path.join(CURRENT_DIR, 'trained_models')
 RESULTS_DIR = os.path.join(CURRENT_DIR, 'training_results')
-BATCH_SIZE = 16
-REGRESSOR_EPOCHS = 2000
-Z_DIM = 150
+BATCH_SIZE = 128
+REGRESSOR_EPOCHS = 1000
+Z_DIM = 64
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
@@ -37,7 +37,7 @@ def init_weights(m):
 def load_vae_model(x_dim, z_dim):
     """加载预训练的VAE模型"""
     print("正在加载VAE模型...")
-    z_dim = min(Z_DIM, max(50, x_dim // 8))
+    z_dim = min(Z_DIM, max(32, x_dim // 8))
     vae = VAE(x_dim, z_dim)
     checkpoint = torch.load(os.path.join(MODELS_DIR, 'vae_model.pth'), map_location='cpu', weights_only=True)
     vae.load_state_dict(checkpoint['vae_state_dict'])
@@ -76,7 +76,7 @@ def train_regressor_epoch(regressor, loader, optimizer, epoch, vae):
                 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(regressor.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(regressor.parameters(), max_norm=5.0)
             optimizer.step()
             
             total_loss += loss.item() * x.size(0)
@@ -144,9 +144,6 @@ def test_regressor_model(regressor, test_loader, vae, scaler_y):
                 
                 pred_time_original = scaler_y.inverse_transform(pred_time.cpu().numpy().reshape(-1, 1))
                 true_time_original = scaler_y.inverse_transform(t.cpu().numpy().reshape(-1, 1))
-                # log反变换
-                pred_time_original = np.expm1(pred_time_original)
-                true_time_original = np.expm1(true_time_original)
                 
                 valid_batches += x.size(0)
                 
@@ -287,14 +284,15 @@ if __name__ == '__main__':
     x_dim = sample_X.shape[1]
     
     # 加载预训练的VAE
-    z_dim = min(Z_DIM, max(50, x_dim // 8))
+    z_dim = min(Z_DIM, max(32, x_dim // 8))
     vae = load_vae_model(x_dim, z_dim)
     
     regressor = Regressor(z_dim)
     regressor = regressor.to(device)
     regressor.apply(init_weights)
     
-    optimizer = optim.Adam(regressor.parameters(), lr=1e-5, weight_decay=1e-5)
+    optimizer = optim.AdamW(regressor.parameters(), lr=3e-4, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200, eta_min=1e-5)
     regressor_history = {'epoch': [], 'loss': []}
     
     for epoch in range(REGRESSOR_EPOCHS):
@@ -302,6 +300,7 @@ if __name__ == '__main__':
         
         regressor_history['epoch'].append(epoch + 1)
         regressor_history['loss'].append(avg_loss)
+        scheduler.step()
         
         if epoch % 100 == 0:
             print(f"Regressor Epoch {epoch+1}, Loss: {avg_loss:.6f}")

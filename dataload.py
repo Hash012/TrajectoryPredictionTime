@@ -4,7 +4,7 @@ import pandas as pd                   # 数据处理库
 import os                            # 操作系统接口
 import torch                         # PyTorch深度学习框架
 from torch.utils.data import Dataset, DataLoader  # PyTorch数据加载工具
-from sklearn.preprocessing import StandardScaler  # 数据标准化工具
+from sklearn.preprocessing import StandardScaler, MinMaxScaler  # 数据标准化工具
 
 class TrajectoryComplexDataset(Dataset):
     def __init__(self, xx_path, yy_path, tt_path, scaler_X_real=None, scaler_X_imag=None, scaler_y=None):
@@ -12,31 +12,26 @@ class TrajectoryComplexDataset(Dataset):
         xx = pd.read_excel(xx_path, header=None).values  # shape: (样本数, n)
         yy = pd.read_excel(yy_path, header=None).values  # shape: (样本数, n)
         tt = pd.read_excel(tt_path, header=None).values  # shape: (样本数, 1) 或 (样本数,)
+        
+        # 找到最小的样本数，统一数据长度
+        min_samples = min(xx.shape[0], yy.shape[0], tt.shape[0])
+        print(f"数据文件样本数:")
+        print(f"  xx.xlsx: {xx.shape[0]} 样本")
+        print(f"  yy.xlsx: {yy.shape[0]} 样本") 
+        print(f"  tt.xlsx: {tt.shape[0]} 样本")
+        print(f"  统一使用最少样本数: {min_samples}")
+        
+        # 截取到最小样本数
+        xx = xx[:min_samples]
+        yy = yy[:min_samples]
+        tt = tt[:min_samples]
 
         # 合成为复数
         X_complex = xx + 1j * yy  # shape: (样本数, n)
         self.X = X_complex
-        # 先对y做log1p变换
-        self.y = np.log1p(tt)
+        # 不做对数变换，直接使用原始时间值
+        self.y = tt.astype(float)
         
-        # # ==================== 目标变量 't' 的鲁棒预处理 ====================
-        # # 动机: 经过数据分析(data_analyzer.py)，我们发现目标变量t存在极端离群值，
-        # #       导致模型训练困难，MSE/MAE指标异常巨大。为了解决这个问题，
-        # #       我们采用“先缩尾，再log变换”的策略，从数据层面根除离群值的影响。
-
-        # # 步骤 1: 缩尾处理 (Winsorization)
-        # # 目的: 消除极端离群值的影响，同时保留绝大多数数据的分布。
-        # # 方法: 计算99百分位数，并将所有超过该值的数据点强制替换为该值。
-        # #       这是一种比直接删除离群值更温和、信息损失更少的处理方式。
-        # p99 = np.percentile(tt, 99)
-        # tt_winsorized = np.clip(tt, a_min=None, a_max=p99)
-        
-        # # 步骤 2: 对数变换 (Log Transform)
-        # # 目的: 对经过缩尾处理后仍然高度右偏的数据进行变换，使其分布更接近正态，
-        # #       并压缩数值范围，使模型更容易学习。
-        # # 方法: 使用np.log1p，即log(1+x)，它对0值友好，数值上更稳定。
-        # self.y = np.log1p(tt_winsorized)
-        # # ====================================================================
         
         # 标准化处理
         if scaler_X_real is None:

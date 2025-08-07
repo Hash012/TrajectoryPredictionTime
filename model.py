@@ -57,6 +57,28 @@ class ComplexLinear(nn.Module):
     def forward(self, x):
         return self.fc_real(x.real) + 1j * self.fc_imag(x.imag)
 
+class ComplexTanh(nn.Module):
+    """
+    复数Tanh激活函数模块
+    
+    功能：对复数张量分别对实部和虚部应用Tanh激活，约束输出范围在[-1,1]
+    继承：torch.nn.Module
+    """
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x):
+        """
+        前向传播
+        
+        参数:
+            x: 复数张量
+            
+        返回:
+            复数张量，实部和虚部都被约束在[-1,1]范围内
+        """
+        return torch.tanh(x.real) + 1j * torch.tanh(x.imag)
+
 class VAE(nn.Module):
     """
     变分自编码器(VAE)模型
@@ -105,22 +127,22 @@ class VAE(nn.Module):
             ComplexLinear(x_dim, 800), 
             ModReLU(),
             ComplexLinear(800, 456),
-            ModReLU(),
-            ComplexLinear(456, 128),
+            # ModReLU(),
+            # ComplexLinear(456, 128),
             ModReLU()
         )
         
         # 潜在空间参数
-        self.fc_mu = ComplexLinear(128, z_dim)      # 均值
-        self.fc_logvar = ComplexLinear(128, z_dim)  # 对数方差
+        self.fc_mu = ComplexLinear(456, z_dim)      # 均值
+        self.fc_logvar = ComplexLinear(456, z_dim)  # 对数方差
         
         # 解码器：从潜在空间重构轨迹
         self.decoder = nn.Sequential(
-            ComplexLinear(z_dim, 128),
+            ComplexLinear(z_dim, 456),
             ModReLU(), 
-            ComplexLinear(128, 800),
-            ModReLU(),
-            ComplexLinear(800, x_dim)  
+            # ComplexLinear(128, 800),
+            # ModReLU(),
+            ComplexLinear(456, x_dim)  
         )
     
     def encode(self, x):
@@ -216,6 +238,32 @@ class VAE(nn.Module):
         # 返回: (重构轨迹, 均值, 对数方差, 潜在变量)
         return recon_x, mu, logvar, z
 
+class ComplexDropout(nn.Module):
+    """对复数张量分别在实部和虚部施加Dropout"""
+    def __init__(self, p: float = 0.1):
+        super().__init__()
+        self.p = p
+    def forward(self, x):
+        return torch.dropout(x.real, self.p, self.training) + 1j * torch.dropout(x.imag, self.p, self.training)
+
+class ComplexResBlock(nn.Module):
+    """复数残差块：Linear-Norm-ReLU-Dropout-Linear-Norm + 残差"""
+    def __init__(self, dim: int, p: float = 0.1):
+        super().__init__()
+        self.fc1 = ComplexLinear(dim, dim)
+        self.norm1 = ComplexLayerNorm(dim)
+        self.act = ModReLU()
+        self.drop = ComplexDropout(p)
+        self.fc2 = ComplexLinear(dim, dim)
+        self.norm2 = ComplexLayerNorm(dim)
+
+    def forward(self, x):
+        out = self.fc1(x)
+        out = self.act(self.norm1(out))
+        out = self.drop(out)
+        out = self.norm2(self.fc2(out))
+        return self.act(x + out)
+
 class Regressor(nn.Module):
     """
     回归器模型
@@ -223,37 +271,35 @@ class Regressor(nn.Module):
     def __init__(self, z_dim):
         super().__init__()
         
-        # 1. 复数特征提取器
+        # 1. 复数特征提取 + 残差块
         self.feature_extractor = nn.Sequential(
-            ComplexLayerNorm(z_dim),
             ComplexLinear(z_dim, 1024),
-            ModReLU(),  
+            ComplexLayerNorm(1024), ModReLU(), ComplexDropout(0.05),
+            ComplexResBlock(1024, p=0.05),
+            ComplexResBlock(1024, p=0.05),
             ComplexLinear(1024, 512),
-            ModReLU(),
+            ComplexLayerNorm(512), ModReLU(), ComplexDropout(0.05),
+            ComplexResBlock(512, p=0.05),
             ComplexLinear(512, 256),
-            ModReLU(),
+            ComplexLayerNorm(256), ModReLU(), ComplexDropout(0.05),
+            ComplexResBlock(256, p=0.05),
             ComplexLinear(256, 128),
-            ModReLU(),
-            ComplexLinear(128, 64),
-            ModReLU(),
-            ComplexLinear(64, 32),
-            ModReLU(),
-            ComplexLinear(32, 16),
-            ModReLU(),
-            ComplexLinear(16, 8),
-            ModReLU()
+            ComplexLayerNorm(128), ModReLU(),
+            ComplexResBlock(128, p=0.05)
         )
-        
-        # 2. 实数回归头
-        # 输入维度为 16 (8 from real part + 8 from imag part)
-        self.regression_head = nn.Linear(16, 1)
+        # 2. 桥接：实部|虚部 → 实数 MLP
+        self.regression_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.LayerNorm(128), nn.GELU(), nn.Dropout(0.1),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64), nn.GELU(), nn.Dropout(0.1),
+            nn.Linear(64, 1)
+        )
     
     def forward(self, z):
         # 步骤1: 提取复数特征
         complex_features = self.feature_extractor(z)
-        
         # 步骤2: 桥接 - 将复数特征的实部和虚部拼接为实数特征向量
         real_features = torch.cat((complex_features.real, complex_features.imag), dim=1)
-        
         # 步骤3: 使用实数头进行最终预测，确保输出为实数
         return self.regression_head(real_features)

@@ -4,7 +4,7 @@ import os
 import torch.nn as nn
 import torch.optim as optim
 from dataload import get_dataloader
-from model import VAE, ComplexLinear, ComplexLinear
+from model import VAE, Regressor, ComplexLinear, ComplexTanh
 import joblib
 import json
 import numpy as np
@@ -29,9 +29,9 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(CURRENT_DIR, 'datas')
 MODELS_DIR = os.path.join(CURRENT_DIR, 'trained_models')
 RESULTS_DIR = os.path.join(CURRENT_DIR, 'training_results')
-BATCH_SIZE = 16
-VAE_EPOCHS = 500
-Z_DIM = 150  # 从20增加到100，减少维度压缩比 
+BATCH_SIZE = 64   # 最佳设置：保证足够的梯度更新频率
+VAE_EPOCHS = 800   # 适度延长训练，避免过度训练
+Z_DIM = 64  # 调整潜在空间维度，防止潜在空间塌陷 
 
 def init_weights(m: nn.Module) -> None:
     """初始化网络权重为Kaiming Normal，并确保能处理ComplexLinear"""
@@ -39,7 +39,7 @@ def init_weights(m: nn.Module) -> None:
         torch.nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
         if m.bias is not None:
             torch.nn.init.constant_(m.bias, 0.0)
-    elif isinstance(m, ComplexLinear): # 专门处理我们自定义的复数层
+    elif hasattr(m, '__class__') and m.__class__.__name__ == 'ComplexLinear': # 专门处理我们自定义的复数层
         # 对内部的实部和虚部Linear层分别进行Kaiming初始化
         torch.nn.init.kaiming_normal_(m.fc_real.weight, mode='fan_in', nonlinearity='relu')
         torch.nn.init.kaiming_normal_(m.fc_imag.weight, mode='fan_in', nonlinearity='relu')
@@ -48,67 +48,93 @@ def init_weights(m: nn.Module) -> None:
         if m.fc_imag.bias is not None:
             torch.nn.init.constant_(m.fc_imag.bias, 0.0)
 
-def vae_loss_fn(recon_x: torch.Tensor, x: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, epoch: int = 0, total_epochs: int = 500) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def vae_loss_fn(recon_x: torch.Tensor, x: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, regressor=None, t: torch.Tensor = None, epoch: int = 0, total_epochs: int = 500) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    计算VAE损失函数（修复复数损失计算）
+    计算VAE损失函数（支持联合训练）
     
     Args:
         recon_x: 重构输出
         x: 原始输入
-        mu: 均值
+        mu: 均值（关键的潜在表示）
         logvar: 对数方差
+        regressor: 辅助回归器（可选，用于联合训练）
+        t: 目标值（可选，用于联合训练）
         epoch: 当前epoch
         total_epochs: 总epoch数
         
     Returns:
-        total_loss, recon_loss, kl_loss
+        total_loss, recon_loss, kl_loss, regression_loss
     """
-    # 动机: 我们的目标是为下游任务提供信息最丰富的mu，因此重构损失是黄金标准。
-    #      我们将KL损失的权重降得很低，使其主要起正则化作用，防止过拟合，
-    #      同时让模型全力优化重构损失。
-    
-    # 1. 重构损失: 使用被证明效果较好的“幅值+相位”组合
+    # 1. 重构损失: 使用多尺度损失来捕获不同层次的特征
+    # 幅值损失
     magnitude_loss = torch.mean(torch.abs(torch.abs(recon_x) - torch.abs(x)))
+    
+    # 相位损失
     phase_diff = torch.angle(recon_x) - torch.angle(x)
-    # 将相位差限制在[-π, π]范围内
     phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
     phase_loss = torch.mean(torch.abs(phase_diff))
-    recon_loss = magnitude_loss + 0.2 * phase_loss
     
-    # 2. KL散度损失: 使用sqrt组合
+    # 复数MSE损失（同时考虑实部和虚部）
+    complex_mse = torch.mean(torch.abs(recon_x - x)**2)
+    
+    # 组合重构损失 - 稍微增加幅值权重，但保持平衡
+    recon_loss = 0.6 * magnitude_loss + 0.2 * phase_loss + 0.2 * complex_mse
+    
+    # 2. KL散度损失: 使用更温和的正则化
     kl_loss_real = -0.5 * torch.mean(1 + logvar.real - mu.real.pow(2) - logvar.real.exp())
     kl_loss_imag = -0.5 * torch.mean(1 + logvar.imag - mu.imag.pow(2) - logvar.imag.exp())
     kl_loss = torch.sqrt(kl_loss_real**2 + kl_loss_imag**2)#自创的，目前看效果更好
     # 直接相加，是更标准的做法
     # kl_loss = kl_loss_real + kl_loss_imag
     
-    # 3. KL退火与总损失: 延长退火期并使用较低的KL权重
-    kl_weight = min(1.0, epoch / (total_epochs * 0.3))
-    total_loss = recon_loss + kl_weight * 0.25 * kl_loss
+    # 3. 添加mu的正则化项，鼓励mu具有良好的分布特性
+    # 防止mu的值过大或过小
+    mu_reg = 0.01 * torch.mean(torch.abs(mu)**2)
     
-    return total_loss, recon_loss, kl_loss
+    # 4. KL 退火：前 10% epoch 线性从 0 → 1，其后保持 1.0
+    warmup_epochs = int(total_epochs * 0.1)
+    if epoch < warmup_epochs:
+        kl_weight = (epoch / max(1, warmup_epochs))  # 线性增大
+    else:
+        kl_weight = 1.0
+    
+    # 5. 回归损失（联合训练）：让VAE学会提取对预测有用的特征
+    regression_loss = torch.tensor(0.0, device=recon_x.device)
+    if regressor is not None and t is not None:
+        t_pred = regressor(mu)
+        regression_loss = nn.MSELoss()(t_pred, t.view_as(t_pred))
+    
+    # 6. 总损失：平衡重构和预测能力
+    gamma = 0.6  # 适度强调回归损失，保持平衡
+    total_loss = recon_loss + kl_weight * kl_loss + mu_reg + gamma * regression_loss
+    
+    return total_loss, recon_loss, kl_loss, regression_loss
 
-def train_vae_epoch(vae: VAE, loader, optimizer: optim.Optimizer, current_epoch: int = 0, total_epochs: int = 500) -> Tuple[float, float, float, int]:
+def train_vae_epoch(vae: VAE, loader, optimizer: optim.Optimizer, regressor=None, current_epoch: int = 0, total_epochs: int = 500) -> Tuple[float, float, float, float, int]:
     """
-    训练VAE一个epoch
+    训练VAE一个epoch（支持联合训练）
     
     Args:
         vae: VAE模型
         loader: 数据加载器
         optimizer: 优化器
+        regressor: 辅助回归器（可选）
+        current_epoch: 当前epoch
+        total_epochs: 总epoch数
         
     Returns:
-        avg_loss, avg_recon_loss, avg_kl_loss, valid_batches
+        avg_loss, avg_recon_loss, avg_kl_loss, avg_regression_loss, valid_batches
     """
     vae.train()
     
     total_loss = 0.0
     total_recon_loss = 0.0
     total_kl_loss = 0.0
+    total_regression_loss = 0.0
     valid_batches = 0
     error_count = 0
     
-    for batch_idx, (x, _) in enumerate(loader):
+    for batch_idx, (x, t) in enumerate(loader):
         try:
             # 数据类型转换和设备迁移
             if isinstance(x, np.ndarray):
@@ -116,9 +142,14 @@ def train_vae_epoch(vae: VAE, loader, optimizer: optim.Optimizer, current_epoch:
             else:
                 x_complex = x.to(dtype=torch.complex64, device=device)
             
+            if isinstance(t, np.ndarray):
+                t_tensor = torch.from_numpy(t).to(dtype=torch.float32, device=device)
+            else:
+                t_tensor = t.to(dtype=torch.float32, device=device)
+            
             # 前向传播
             recon_x, mu, logvar, _ = vae(x_complex)
-            loss, recon_loss, kl_loss = vae_loss_fn(recon_x, x_complex, mu, logvar, current_epoch, total_epochs)
+            loss, recon_loss, kl_loss, regression_loss = vae_loss_fn(recon_x, x_complex, mu, logvar, regressor, t_tensor, current_epoch, total_epochs)
             
             # 检查损失值是否有效
             if torch.isnan(loss) or torch.isinf(loss):
@@ -129,7 +160,8 @@ def train_vae_epoch(vae: VAE, loader, optimizer: optim.Optimizer, current_epoch:
             # 反向传播
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=0.5)
+            # 梯度裁剪 - 放宽限制，允许更大的梯度更新
+            torch.nn.utils.clip_grad_norm_(list(vae.parameters()) + list(regressor.parameters()) if regressor else vae.parameters(), max_norm=5.0)
             optimizer.step()
             
             # 累计损失
@@ -137,6 +169,7 @@ def train_vae_epoch(vae: VAE, loader, optimizer: optim.Optimizer, current_epoch:
             total_loss += loss.item() * batch_size
             total_recon_loss += recon_loss.item() * batch_size
             total_kl_loss += kl_loss.item() * batch_size
+            total_regression_loss += regression_loss.item() * batch_size
             valid_batches += batch_size
             
         except Exception as e:
@@ -149,13 +182,14 @@ def train_vae_epoch(vae: VAE, loader, optimizer: optim.Optimizer, current_epoch:
         avg_loss = total_loss / valid_batches
         avg_recon_loss = total_recon_loss / valid_batches
         avg_kl_loss = total_kl_loss / valid_batches
+        avg_regression_loss = total_regression_loss / valid_batches
     else:
-        avg_loss = avg_recon_loss = avg_kl_loss = 0.0
+        avg_loss = avg_recon_loss = avg_kl_loss = avg_regression_loss = 0.0
     
     if error_count > 0:
         logger.warning(f"本epoch有 {error_count} 个batch出错")
     
-    return avg_loss, avg_recon_loss, avg_kl_loss, valid_batches
+    return avg_loss, avg_recon_loss, avg_kl_loss, avg_regression_loss, valid_batches
 
 def test_vae_model(vae: VAE, test_loader) -> Dict[str, Any]:
     """
@@ -193,7 +227,7 @@ def test_vae_model(vae: VAE, test_loader) -> Dict[str, Any]:
                 
                 # 前向传播
                 recon_x, mu, logvar, _ = vae(x_complex)
-                _, recon_loss, kl_loss = vae_loss_fn(recon_x, x_complex, mu, logvar, 0, 1)
+                _, recon_loss, kl_loss, _ = vae_loss_fn(recon_x, x_complex, mu, logvar, None, None, 0, 1)
                 
                 batch_size = x.size(0)
                 total_recon_loss += recon_loss.item() * batch_size
@@ -396,7 +430,7 @@ def main() -> None:
         logger.info(f"输入维度: {x_dim}")
         
         # 根据输入维度动态调整潜在空间维度
-        z_dim = min(Z_DIM, max(50, x_dim // 8))  # 压缩比约为6:1
+        z_dim = min(Z_DIM, max(32, x_dim // 8))  # 压缩比约为(压缩比取决于 x_dim)
         logger.info(f"潜在空间维度: {z_dim} (压缩比: {x_dim/z_dim:.1f}:1)")
         
         # 初始化VAE
@@ -404,29 +438,51 @@ def main() -> None:
         vae = vae.to(device)
         vae.apply(init_weights)
         
-        # 训练VAE
-        optimizer = optim.AdamW(vae.parameters(), lr=5e-5)
-        # 动机: 引入学习率调度器。当模型训练进入瓶颈期（损失不再下降）时，
-        #      自动降低学习率可以帮助模型进行更精细的搜索，有助于达到更低的重构损失。
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=20, factor=0.5, verbose=True)
-        vae_history = {'epoch': [], 'total_loss': [], 'recon_loss': [], 'kl_loss': []}
+        # 初始化辅助回归器（用于联合训练）
+        regressor = Regressor(z_dim)
+        regressor = regressor.to(device)
+        regressor.apply(init_weights)
+        
+        logger.info("启用联合训练：VAE + 辅助回归器")
+        
+        # 训练VAE和辅助回归器 - 联合优化
+        optimizer = optim.AdamW(
+            list(vae.parameters()) + list(regressor.parameters()), 
+            lr=8e-5,  # 平衡收敛速度和稳定性
+            weight_decay=1e-5,  # 轻微的权重衰减防止过拟合
+            betas=(0.9, 0.999)
+        )
+        
+        # 使用ReduceLROnPlateau，当损失不再下降时降低学习率
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='min',
+            patience=20,  # 20个epoch不改善就降低学习率，更积极的调度
+            factor=0.7,   # 每次降低30%，保持更多学习能力
+            verbose=True,
+            min_lr=5e-6
+        )
+        vae_history = {'epoch': [], 'total_loss': [], 'recon_loss': [], 'kl_loss': [], 'regression_loss': []}
         
         logger.info(f"开始训练，总epoch数: {VAE_EPOCHS}")
         for epoch in range(VAE_EPOCHS):
-            avg_loss, avg_recon_loss, avg_kl_loss, valid_batches = train_vae_epoch(
-                vae, train_loader, optimizer, epoch, VAE_EPOCHS
+            avg_loss, avg_recon_loss, avg_kl_loss, avg_regression_loss, valid_batches = train_vae_epoch(
+                vae, train_loader, optimizer, regressor, epoch, VAE_EPOCHS
             )
             
             vae_history['epoch'].append(epoch + 1)
             vae_history['total_loss'].append(avg_loss)
             vae_history['recon_loss'].append(avg_recon_loss)
             vae_history['kl_loss'].append(avg_kl_loss)
+            vae_history['regression_loss'].append(avg_regression_loss)
             
             if epoch % 50 == 0:
                 logger.info(f"VAE Epoch {epoch+1}, Loss: {avg_loss:.6f}")
-                logger.info(f"  Recon: {avg_recon_loss:.6f}, KL: {avg_kl_loss:.6f}")
+                logger.info(f"  Recon: {avg_recon_loss:.6f}, KL: {avg_kl_loss:.6f}, Regr: {avg_regression_loss:.6f}")
                 logger.info(f"  有效batch数: {valid_batches}")
-            # 使用总损失更新学习率调度器
+                logger.info(f"  当前学习率: {optimizer.param_groups[0]['lr']:.2e}")
+            
+            # 更新学习率（基于总损失）
             scheduler.step(avg_loss)
             
             # 早停机制：如果KL损失过小，提前停止
